@@ -13,16 +13,20 @@ use tokio::net::TcpListener;
 use tower::util::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-async fn routes_app() -> Router<()> {
+async fn make_db() -> PgPool {
     let db_connection_str = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/manyevents".to_string());
 
-    let pool = PgPoolOptions::new()
+    PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(Duration::from_secs(3))
         .connect(&db_connection_str)
         .await
-        .expect("can't connect to database");
+        .expect("can't connect to database")
+}
+
+async fn routes_app() -> Router<()> {
+    let pool = make_db().await;
 
     let router: Router<()> = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
@@ -108,10 +112,11 @@ mod tests {
         routes_app().await
     }
 
-    // #[fixture]
-    // async fn db() -> Router<()> {
-    //     routes_app().await
-    // }
+    #[fixture]
+    async fn conn() -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+        let pool = make_db().await;
+        pool.acquire().await.expect("Error connection")
+    }
 
     #[rstest]
     #[tokio::test]
@@ -130,17 +135,27 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn get_db(#[future] app: Router<()>) {
+    async fn get_db(
+        #[future] app: Router<()>,
+        #[future] conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    ) {
         let response = app
             .await
             .oneshot(Request::builder().uri("/db").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
+        let f: Result<String, (StatusCode, String)> =
+            sqlx::query_scalar("select 'hello world from pg'")
+                .fetch_one(&mut *(conn.await))
+                .await
+                .map_err(internal_error);
+
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body_str = std::str::from_utf8(&body).unwrap();
         assert_eq!(body_str, "hello world from pg");
+        assert_eq!(f.unwrap(), "hello world from pg");
     }
 }
