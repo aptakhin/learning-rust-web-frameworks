@@ -14,39 +14,26 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::sync::mpsc;
 use std::time::Duration;
 
-fn app() -> Router<PgPool> {
+async fn app() -> Router<PgPool> {
     let db_connection_str = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/manyevents".to_string());
 
-    let mut router = Router::new()
-        .route("/", get(|| async { "Hello, World!" }));
 
-    let (tx, rx) = mpsc::channel();
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect(&db_connection_str)
+        .await
+        .expect("can't connect to database");
 
-    // TODO: Issue to run async code sync function to bootstrap database
-    let handle = Handle::current();
-    std::thread::spawn(move || {
-        handle.block_on(async {
-            let pool = PgPoolOptions::new()
-                .max_connections(5)
-                .acquire_timeout(Duration::from_secs(3))
-                .connect(&db_connection_str)
-                .await
-                .expect("can't connect to database");
 
-            router = router.route(
-                    "/db",
-                    get(using_connection_pool_extractor).post(using_connection_extractor),
-                )
-                .with_state(pool);
-
-            tx.send(router).expect("Failed to send router");
-        });
-    });
-
-    router = rx.recv().expect("Failed to receive router");
-
-    router
+    Router::new()
+        .route("/", get(|| async { "Hello, World!" }))
+        .route(
+            "/db",
+            get(using_connection_pool_extractor).post(using_connection_extractor),
+        )
+        .with_state(pool)
 }
 
 #[tokio::main]
@@ -61,8 +48,12 @@ async fn main() {
 
     let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
     tracing::debug!("listening on {}", listener.local_addr().unwrap());
-    // TODO: `Serve<Router<Pool<Postgres>>, _>` is not a future
-    axum::serve(listener, app()).await.unwrap();
+    // error[E0277]: the trait bound `for<'a> Router<Pool<Postgres>>: tower_service::Service<IncomingStream<'a>>` is not satisfied
+    // --> src/main.rs:52:27
+    // |
+    // 52 |     axum::serve(listener, app().await).await.unwrap();
+    // |     -----------           ^^^^^^^^^^^ the trait `for<'a> tower_service::Service<IncomingStream<'a>>` is not implemented for `Router<Pool<Postgres>>`
+    axum::serve(listener, app().await).await.unwrap();
 }
 
 async fn using_connection_pool_extractor(
