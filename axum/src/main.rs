@@ -1,23 +1,21 @@
-use tokio::runtime::Handle;
-
 use axum::{
     async_trait,
     extract::{FromRef, FromRequestParts, State},
     http::{request::Parts, StatusCode},
-    routing::{get},
+    routing::get,
     Router,
 };
 
+use http_body_util::BodyExt;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use tokio::net::TcpListener;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use std::sync::mpsc;
 use std::time::Duration;
+use tokio::net::TcpListener;
+use tower::util::ServiceExt;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-async fn app() -> Router<PgPool> {
+async fn routes_app() -> Router<()> {
     let db_connection_str = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/manyevents".to_string());
-
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -26,14 +24,15 @@ async fn app() -> Router<PgPool> {
         .await
         .expect("can't connect to database");
 
-
-    Router::new()
+    let router: Router<()> = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
         .route(
             "/db",
             get(using_connection_pool_extractor).post(using_connection_extractor),
         )
-        .with_state(pool)
+        .with_state(pool);
+
+    router
 }
 
 #[tokio::main]
@@ -48,12 +47,9 @@ async fn main() {
 
     let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
     tracing::debug!("listening on {}", listener.local_addr().unwrap());
-    // error[E0277]: the trait bound `for<'a> Router<Pool<Postgres>>: tower_service::Service<IncomingStream<'a>>` is not satisfied
-    // --> src/main.rs:52:27
-    // |
-    // 52 |     axum::serve(listener, app().await).await.unwrap();
-    // |     -----------           ^^^^^^^^^^^ the trait `for<'a> tower_service::Service<IncomingStream<'a>>` is not implemented for `Router<Pool<Postgres>>`
-    axum::serve(listener, app().await).await.unwrap();
+
+    let app = routes_app().await;
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn using_connection_pool_extractor(
@@ -98,7 +94,6 @@ where
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,14 +101,23 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use rstest::{rstest};
+    use rstest::{fixture, rstest};
+
+    #[fixture]
+    async fn app() -> Router<()> {
+        routes_app().await
+    }
+
+    // #[fixture]
+    // async fn db() -> Router<()> {
+    //     routes_app().await
+    // }
 
     #[rstest]
     #[tokio::test]
-    async fn get_root() {
-        let app = app();
-
+    async fn get_root(#[future] app: Router<()>) {
         let response = app
+            .await
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -126,12 +130,9 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn get_db() {
-        let app = app();
-
-        // TODO: Issue to
-        // error[E0599]: the method `oneshot` exists for struct `Router<Pool<Postgres>>`, but its trait bounds were not satisfied
+    async fn get_db(#[future] app: Router<()>) {
         let response = app
+            .await
             .oneshot(Request::builder().uri("/db").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -139,6 +140,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"Hello, World!");
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert_eq!(body_str, "hello world from pg");
     }
 }
